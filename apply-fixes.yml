@@ -1,0 +1,128 @@
+name: Apply import/export fixes and open PR
+on:
+  workflow_dispatch:
+
+jobs:
+  apply-fixes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Create App.tsx patch
+        run: |
+          cat > App.tsx.patch <<'PATCH'
+*** Begin Patch
+*** Update File: App.tsx
+@@
+-import { PrivacyPolicy } from "./components/PrivacyPolicy";
++import PrivacyPolicy from "./components/PrivacyPolicy";
+*** End Patch
+PATCH
+
+      - name: Apply App.tsx patch
+        run: |
+          git apply --ignore-space-change --ignore-whitespace App.tsx.patch || echo "Patch apply returned non-zero (maybe already applied)."
+
+      - name: Create fixer script
+        run: |
+          cat > fix-import-exports.sh <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s globstar
+
+# Usage: ./fix-import-exports.sh
+# Creates .bak backups next to any files it edits.
+
+mapfile -t matches < <(grep -R --line-number --exclude-dir=node_modules --exclude-dir=.git -E "from ['\"]\./components/[^'\";]+['\"]" . || true)
+
+if [ ${#matches[@]} -eq 0 ]; then
+  echo "No ./components/ imports found."
+  exit 0
+fi
+
+for entry in "${matches[@]}"; do
+  file=$(echo "$entry" | cut -d: -f1)
+  code=$(echo "$entry" | cut -d: -f3-)
+  module=$(echo "$code" | sed -n "s/.*from ['\"]\([^'\"]*\)['\"].*/\1/p")
+  base=$(basename "$module")
+  dir=$(dirname "$file")
+  comp1="$dir/${module##*/}.tsx"
+  comp2="./${module#./}.tsx"
+  comp3="src/${module#./}.tsx"
+  comp=""
+
+  if [ -f "$comp1" ]; then comp="$comp1"; fi
+  if [ -z "$comp" ] && [ -f "$comp2" ]; then comp="$comp2"; fi
+  if [ -z "$comp" ] && [ -f "$comp3" ]; then comp="$comp3"; fi
+
+  if [ -z "$comp" ]; then
+    echo "WARN: Could not locate component file for import in $file -> $module (skipping)"
+    continue
+  fi
+
+  if grep -qE "export\s+default" "$comp"; then
+    perl -0777 -pe "s/import\s+\{\s*$base\s*\}\s+from\s+(['\"]$module['\"]\s*;)/import $base from $1/smg" -i.bak "$file"
+    echo "Updated import to default in $file (component uses default export): $module"
+  elif grep -qE "export\s+(function|const|class)\s+$base" "$comp"; then
+    perl -0777 -pe "s/import\s+$base\s+from\s+(['\"]$module['\"]\s*;)/import { $base } from $1/smg" -i.bak "$file"
+    echo "Updated import to named in $file (component uses named export): $module"
+  else
+    echo "INFO: Ambiguous export style for $comp — manual review suggested (skipped): $module"
+  fi
+done
+
+echo
+echo "Done. Review changes and .bak backups before committing:"
+echo "  git status"
+echo "  git diff"
+SCRIPT
+          chmod +x fix-import-exports.sh
+
+      - name: Run fixer script
+        run: |
+          ./fix-import-exports.sh || echo "Fixer script returned non-zero (check logs)."
+
+      - name: List changed files
+        run: |
+          git status --porcelain || true
+          git --no-pager diff --name-only || true
+
+      - name: Commit & push changes
+        env:
+          GIT_AUTHOR_NAME: "github-actions[bot]"
+          GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
+          GITHUB_TOKEN_FOR_PUSH: ${{ secrets.GH_PAT }}
+        run: |
+          git config user.name "$GIT_AUTHOR_NAME"
+          git config user.email "$GIT_AUTHOR_EMAIL"
+          BRANCH="feat/fix-import-exports"
+          git checkout -b "$BRANCH" || git checkout "$BRANCH"
+          # move .bak files to dev-backups to avoid committing them
+          mkdir -p dev-backups || true
+          find . -name '*.bak' -type f -exec mv {} dev-backups/ \; || true
+          git add -A
+          git commit -m "fix: correct component import/export mismatches (PrivacyPolicy + others)" || echo "No changes to commit"
+          git push https://x-access-token:${GITHUB_TOKEN_FOR_PUSH}@github.com/${{ github.repository }} HEAD:"$BRANCH" --force
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GH_PAT }}
+          commit-message: "fix: correct component import/export mismatches (PrivacyPolicy + others)"
+          title: "fix: correct component import/export mismatches"
+          body: |
+            This PR fixes import/export mismatches between components and their importers (e.g. PrivacyPolicy).
+            - Changes are minimal and limited to import lines.
+            - The workflow moves .bak backups into dev-backups/ for review.
+            - Please review skipped/ambiguous cases listed in the workflow logs (WARN/INFO lines).
+            Local build verification is recommended before merging.
+          base: main
+          head: feat/fix-import-exports
