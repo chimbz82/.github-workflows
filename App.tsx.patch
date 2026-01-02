@@ -1,0 +1,6 @@
+*** Begin Patch
+*** Update File: App.tsx
+@@
+-import { PrivacyPolicy } from "./components/PrivacyPolicy";
++import PrivacyPolicy from "./components/PrivacyPolicy";
+*** End Patch
